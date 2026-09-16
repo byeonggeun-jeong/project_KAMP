@@ -2,7 +2,7 @@
 
 > 문서 상태: Draft v1.1  
 > 작성 기준일: 2026-09-12  
-> 분석 대상: `Input.csv`, `build_dashboard.py`, `train_model.py`
+> 분석 대상: `data/source/Input.csv`, `build_dashboard.py`, `scripts/train_model.py`
 
 ## 1. 문서 목적
 
@@ -51,7 +51,7 @@
 | 미래 Test 성능 | PR-AUC 0.8546, ROC-AUC 0.9580, Recall 0.7453, Precision 0.8959, F1 0.8137 |
 | 중요 변수 후보 | 주입압력, 하부온도2/1/3, 비스킷 두께, 상부온도1, 냉각수 온도, 슬리브 온도 등 |
 
-현재 검증 수치는 과거 데이터에 대한 오프라인 결과이며 운영 성능을 보장하지 않는다. 모델은 `train_model.py`에서 재현 가능하게 학습하고, `defect_model.pkl` 아티팩트로 저장한다.
+현재 검증 수치는 과거 데이터에 대한 오프라인 결과이며 운영 성능을 보장하지 않는다. 모델은 `scripts/train_model.py`에서 재현 가능하게 학습하고, `artifacts/model/defect_model.pkl` 아티팩트로 저장한다.
 
 ### 2.4 통합 관제 운영 루프
 

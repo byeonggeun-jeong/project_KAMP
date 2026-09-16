@@ -7,11 +7,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
+
+BASE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE))
 
 from build_dashboard import build_payload
 
 
-OUT = Path(__file__).parent / "dist" / "data.js"
+OUT = BASE / "dist" / "data.js"
 
 
 def export() -> Path:

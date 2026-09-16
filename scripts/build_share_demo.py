@@ -7,8 +7,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 
-BASE = Path(__file__).parent
-OUT = BASE / "foundry_guard_demo.html"
+BASE = Path(__file__).resolve().parents[1]
+OUT = BASE / "share" / "foundry_guard_demo.html"
 
 
 def demo_data() -> dict[str, object]:
