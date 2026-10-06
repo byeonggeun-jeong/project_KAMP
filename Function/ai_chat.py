@@ -1,20 +1,5 @@
-"""전력 브리핑·질의 — ChatGPT 하네스.
-
-화면이 보내는 재생 시점(day, cursor)에서 **그 시점까지 확정된 자료만** 모아 모델에 건넨다.
-숫자는 전부 이 파일의 함수가 계산하고, 언어 모델은 그 숫자를 읽고 설명·권고만 한다.
-그래서 언어 모델이 숫자를 지어낼 여지를 줄이고, 키가 없어도 숫자 요약은 나온다.
-
-시점 규칙 (화면과 같다)
------------------------
-  재생 행의 `forecast_time` 이 t 이면 그 행의 현재 전력은 [t, t+15분) 구간이고 t+15분에 확정된다.
-  예측은 다음 구간 [t+15분, t+30분) 이다. 브리핑은 **예측 구간이 끝나기 5분 전** 시각으로 표기한다.
-  예) t = 10:45 → 11:00 까지 확정 · 11:00~11:15 예측 · "11:10 브리핑"
-  재생 자료에 :10 시점 관측은 없다 — 본문에 '○○:○○까지 확정값' 을 함께 적는다.
-
-API 키
-------
-  요청마다 받아 쓰고 저장·기록하지 않는다. 모델 이름은 환경변수 OPENAI_MODEL(기본 gpt-4o-mini).
-"""
+"""전력 자료의 대화체 요약과 OpenAI 질의응답·음성을 제공한다.
+API 키가 없으면 수치 기반 요약을 생성하며 서버는 요청 키를 파일에 저장하지 않는다."""
 from __future__ import annotations
 
 import json
@@ -24,24 +9,23 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import config as C
-import serving as S
+import settings as C
+import power_prediction as S
 
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 MAX_TOOL_ROUNDS = 4
 
 
-# ══ 하네스 — 시스템 지시문 ══════════════════════════════════════════
+# 모델 설명과 시스템 지시문
 def _model_summary() -> str:
     res = json.loads((C.MODEL_DIR / "results.json").read_text(encoding="utf-8"))
     m, s = res["모델별"], res.get("결합비율탐색") or {}
-    ens, et, gru, base = m["ensemble"], m["et"], m["gru"], m["persistence"]
+    ens, et, gru = m["ensemble"], m["et"], m["gru"]
     w = s.get("선정_트리비중", res["설정"].get("blend_weight"))
     return (f"- 다음 15분 전력 예측 = ExtraTrees(과거 전력·달력 입력, 기상 미사용) × {w} + "
             f"GRU(과거 96구간=하루 전력 + 달력) × {round(1 - w, 2)}. 비중은 시험 구간 기준으로 골랐다.\n"
             f"- 시험 구간({res['자료']['시험행']:,}개 구간) MSE {ens['시험']['MSE']} · "
-            f"평균 절대오차 {ens['시험']['MAE']} — 직전값 유지 {base['시험']['MSE']} 대비 "
-            f"{round((1 - ens['시험']['MSE'] / base['시험']['MSE']) * 100, 1)}% 낮다. "
+            f"평균 절대오차 {ens['시험']['MAE']}. "
             f"구성 모델 단독: ExtraTrees {et['시험']['MSE']} · GRU {gru['시험']['MSE']}.\n"
             "- 잘 맞는 때: 심야·비가동·부하가 안정적일 때. 어려운 때: 직전 15분 변화가 큰 급변, "
             "아침 시동(7~8시), 점심 전(11시), 교대 전후, 장기 휴무 직후.")
@@ -105,7 +89,7 @@ BRIEFING_FORMAT = """아래 자료로 {label} 시점의 전력 상태를 담당�
 {facts}"""
 
 
-# ══ 사실 모으기 — 재생 시점까지 확정된 것만 ═══════════════════════
+# 사실 모으기 — 재생 시점까지 확정된 것만
 def _frame(day: str) -> pd.DataFrame:
     return S._day(day)
 
@@ -179,7 +163,7 @@ def rule_briefing(f: dict) -> str:
 
 
 
-# ══ 도구 — 질의응답에서 모델이 부른다 ══════════════════════════════
+# 도구 — 질의응답에서 모델이 부른다
 TOOLS = [
     {"type": "function", "function": {
         "name": "get_briefing_facts",
@@ -214,9 +198,7 @@ def _today_profile(day: str, cursor: int) -> dict:
 
 def _model_info() -> dict:
     res = json.loads((C.MODEL_DIR / "results.json").read_text(encoding="utf-8"))
-    names = {"ensemble": "결합(ET 기상 미사용 + GRU)", "et": "ExtraTrees", "et_wx": "ExtraTrees + 기상",
-             "rf": "RandomForest", "hgb": "HistGradientBoosting", "gru": "GRU", "lstm": "LSTM",
-             "persistence": "직전값 유지", "tod_dow": "시각×요일 중앙값"}
+    names = {"ensemble": "결합 (ExtraTrees + GRU)", "et": "ExtraTrees", "gru": "GRU"}
     m = res["모델별"]
     s = res.get("결합비율탐색") or {}
     return {"후보": {names.get(k, k): {"전진검증_평균MSE": v["전진검증_평균"],
@@ -224,10 +206,10 @@ def _model_info() -> dict:
             "결합_트리비중": s.get("선정_트리비중"), "결합비중_고르는_기준": s.get("기준"),
             "결합비중_주의": s.get("주의"),
             "행기준": res["자료"], "한계": [
-                "자료가 2021년 1~9월뿐이라 겨울 피크를 보지 못했다",
+                "시험 구간이 2021년 7~9월이므로 겨울의 예측 성능은 검증하지 않았다",
                 "계측이 변압기 총부하라 설비별 원인을 알 수 없다",
                 "장기 휴무는 시험 구간에 한 번만 있었다",
-                "기상은 결합 모델에 쓰지 않는다(기상 포함 ExtraTrees 는 비교 후보)"]}
+                "기상은 최종 결합 모델의 예측 입력에 사용하지 않는다"]}
 
 
 def run_tool(name: str, args: dict, day: str, cursor: int, threshold: float | None) -> dict:
@@ -240,7 +222,7 @@ def run_tool(name: str, args: dict, day: str, cursor: int, threshold: float | No
     return {"오류": f"모르는 도구: {name}"}
 
 
-# ══ 음성 — OpenAI TTS ═══════════════════════════════════════════════
+# 음성 — OpenAI TTS
 TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
 TTS_VOICE = os.environ.get("OPENAI_TTS_VOICE", "marin")
 TTS_INSTRUCTIONS = ("한국어 공장 관제실 안내 방송처럼 말한다. 차분하고 또렷하게, 조금 빠른 보통 속도로. "
@@ -255,7 +237,7 @@ def speech(text: str, api_key: str, voice: str | None = None) -> bytes:
     return out.read()
 
 
-# ══ 언어 모델 호출 ══════════════════════════════════════════════════
+# 언어 모델 호출
 def _client(api_key: str):
     from openai import OpenAI
     return OpenAI(api_key=api_key, timeout=60)

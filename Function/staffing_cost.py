@@ -1,8 +1,5 @@
-"""계획 생산량을 입력받아 과거 비율로 비용을 가정한다.
-
-공장인원 열은 생산량/전력 합으로 계산된 파생값이다. 실제 배치 인원이나
-생산량 달성에 필요한 최소 인원의 증거로 해석하지 않는다.
-"""
+"""과거 생산 실적의 파생 인원을 참고하여 인원 및 비용을 계산한다.
+원자료의 공장인원은 실제 배치 인원이나 최소 인원의 증거가 아니다."""
 from __future__ import annotations
 
 import calendar as _calendar
@@ -15,27 +12,26 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import config as C
-import preprocessing as P
+import settings as C
+import data_preprocessing as P
 
 HERE = Path(__file__).resolve().parent
-TARIFF = json.loads((HERE / "tariff.json").read_text(encoding="utf-8"))
+TARIFF = json.loads((HERE / "electricity_tariff.json").read_text(encoding="utf-8"))
 LABELS = {"off": "경부하", "mid": "중간부하", "peak": "최대부하"}
 
 
-def _holidays() -> set[str]:
-    """공휴일은 달력 자료 한 곳에서만 읽는다. 없으면 빈 집합(주말만 휴일)."""
-    p = C.CALENDAR_DEFAULT
-    if not p.exists():
-        return set()
-    return set(json.loads(p.read_text(encoding="utf-8")).get("holidays", []))
+CALENDAR = json.loads(C.CALENDAR_DEFAULT.read_text(encoding="utf-8"))
+HOLIDAYS = P.calendar_holidays(CALENDAR, CALENDAR.get("years", {}).keys())
 
 
-HOLIDAYS = _holidays()
+def _check_calendar_year(ts) -> None:
+    if str(ts.year) not in CALENDAR["years"]:
+        raise ValueError(f"공휴일 달력에 등록되지 않은 연도: {ts.year}")
 
 
 def tariff_at(ts, rates=None) -> tuple[str, str, float]:
     """그 시각의 계절·부하대·요율. 2021 요율표 기준."""
+    _check_calendar_year(ts)
     season = ("summer" if ts.month in (6, 7, 8)
               else "winter" if ts.month in (11, 12, 1, 2) else "spring_autumn")
     h = ts.hour + ts.minute / 60 + ts.second / 3600
@@ -55,6 +51,7 @@ def wage_at(hour: int) -> tuple[float, bool]:
 
 
 def day_type(ts) -> str:
+    _check_calendar_year(ts)
     return "휴일" if ts.weekday() >= 5 or ts.strftime("%Y-%m-%d") in HOLIDAYS else "평일"
 
 
@@ -65,7 +62,7 @@ class StaffingOptimizer:
         raw_path = Path(raw_path) if raw_path else C.RAW_DEFAULT
         raw = pd.read_csv(raw_path, encoding="utf-8-sig")
 
-        # **모델링과 같은 규칙으로 시각을 만든다.** 날짜를 적어 지우지 않는다.
+        # 전처리와 동일한 규칙으로 시각축을 만든다.
         log = P.Log()
         log.add = lambda *a, **k: None
         with redirect_stdout(io.StringIO()):
@@ -88,7 +85,7 @@ class StaffingOptimizer:
         self.raw["공장인원"], self.raw["생산량"] = staff, prod
 
     def replay_hourly_interval(self, forecast_time, target_time, prediction, **over):
-        """Historical replay only: use the recorded hourly production as the target."""
+        """과거 기록 재생 시 해당 정시의 생산 실적을 목표로 사용한다."""
         hour = pd.Timestamp(target_time)
         rows = self.raw.loc[self.raw.timestamp == hour]
         if len(rows) != 1:
@@ -113,7 +110,7 @@ class StaffingOptimizer:
         if not math.isfinite(hourly_q) or hourly_q < 0 or not math.isfinite(float(prediction)):
             raise ValueError("생산량과 예측 전력은 유효한 값이어야 합니다.")
 
-        # 같은 시각·같은 날 유형 · **그날보다 앞선 날짜** · 생산량이 Q 이상인 기록
+        # 같은 시각·같은 날 유형 · 그날보다 앞선 날짜 · 생산량이 Q 이상인 기록
         hist = self.raw.loc[(self.raw.timestamp < end.normalize()) & self.raw.staff_valid
                             & (self.raw.timestamp.dt.hour == end.hour)
                             & (self.raw.day_type == day_type(end))

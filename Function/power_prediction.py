@@ -1,22 +1,4 @@
-"""대시보드가 부르는 함수들. **화면 쪽에는 계산 로직을 두지 않는다.**
-
-왜 여기 있나
------------
-예전에는 `Dashboard/backend/app.py` 안에 모델 적재·예측·임계값 산정·비용 계산이 전부
-들어 있었고, 전처리도 `Dashboard/pipeline/` 에 따로 있었다. 그래서 같은 로직이 두 벌이
-됐다 — 모델링 쪽과 화면 쪽이 서로 다른 전처리를 쓰는 상태였다.
-
-이 파일은 **순수 함수만** 둔다. FastAPI 를 모른다. 화면은 이걸 얇게 감싸기만 한다.
-그래서 챗봇이든 배치든 같은 함수를 부르면 같은 답이 나온다.
-
-자료와 모델은 어디서 오나
-------------------------
-  Dataset/preprocessed/processed.csv   `preprocessing.py` 가 만든 것 — 모델링과 같은 파일
-  Model/model_<이름>.joblib            `modeling.py` 가 만든 것 — {estimator, features}
-
-**열 이름은 전처리 결과의 것을 그대로 쓴다.** 화면에 나가는 JSON 만 기존 계약에 맞춘다
-(`forecast_time`·`현재전력` 등) — 프런트엔드를 고치지 않기 위해서다.
-"""
+"""최종 ExtraTrees·GRU 모델을 로드하고 대시보드용 전력 예측, 재생 자료와 경보를 제공한다."""
 from __future__ import annotations
 
 import hashlib
@@ -28,8 +10,8 @@ import joblib
 import numpy as np
 import pandas as pd
 
-import config as C
-from optimization import StaffingOptimizer
+import settings as C
+from staffing_cost import StaffingOptimizer
 
 HERE = Path(__file__).resolve().parent
 _state: dict = {}
@@ -68,15 +50,9 @@ def model_kind(model) -> str:
 
 def load(model_path: Path | None = None, data_path: Path | None = None,
          net_path: Path | None = None, blend: float | None = None) -> dict:
-    """모델과 재생용 자료를 올린다. 한 번만 부르면 된다.
-
-    `net_path` 를 주거나 `Model/model_gru.pt` 가 있으면 **앙상블로 서빙한다** —
-    트리 예측과 순환신경망 시드평균 예측을 고정 반반으로 섞는다. 없으면 트리만 쓴다.
-
-    행은 `modeling.usable()` 로 고른다. **모델링과 같은 규칙이어야** 순환신경망 창이
-    학습 때와 같은 자리에 선다.
-    """
-    import modeling as M
+    """ExtraTrees와 GRU를 로드하여 manifest의 비율로 결합한다.
+    입력 행과 GRU 창은 학습과 동일한 규칙으로 선택한다."""
+    import model_training as M
 
     model_path = Path(model_path or C.MODEL_DIR / "model_et.joblib")
     data_path = Path(data_path or C.OUT_DEFAULT)
@@ -86,7 +62,6 @@ def load(model_path: Path | None = None, data_path: Path | None = None,
     if blend is not None:
         w = float(blend)
     else:
-        # 학습이 전진검증으로 고른 트리 비중(manifest). 기록이 없으면 기본 0.5
         man = model_path.parent / "manifest.json"
         w = (json.loads(man.read_text()).get("blend_weight") if man.exists() else None)
         w = C.BLEND_DEFAULT if w is None else float(w)
@@ -95,20 +70,18 @@ def load(model_path: Path | None = None, data_path: Path | None = None,
     if not model_path.exists():
         raise FileNotFoundError(
             f"모델 파일이 없다: {model_path}\n"
-            f"  python Function/modeling.py --models et   로 만들 수 있다 (약 2분)")
+            f"  python Function/model_training.py --models et   로 만들 수 있다 (약 2분)")
     if not data_path.exists():
         raise FileNotFoundError(
-            f"전처리 결과가 없다: {data_path}\n  python Function/preprocessing.py 를 먼저 돌려라")
+            f"전처리 결과가 없다: {data_path}\n  python Function/data_preprocessing.py 를 먼저 돌려라")
 
-    from artifacts import validate
+    from model_validation import validate
     validate(model_path, net_path if use_net else None)
-    bundle = joblib.load(model_path)      # 우리가 만든 파일만 올린다
+    bundle = joblib.load(model_path)
     if not isinstance(bundle, dict) or not {"estimator", "features"} <= bundle.keys():
         raise ValueError("모델 묶음에 estimator 와 features 가 있어야 한다")
 
-    # **추론에서는 트리 병렬을 끈다.** joblib 의 작업자 풀(OpenMP)이 torch 와 같은
-    # 프로세스에 있으면 종료 때 세그폴트(139)가 난다. 계산 결과는 같고 속도만 조금 준다.
-    # 학습 때의 교착과는 다른 증상이지만 뿌리는 같다 — libomp 가 두 번 올라가는 것.
+    # 추론은 단일 스레드로 실행한다.
     _single_thread(bundle["estimator"])
 
     d = M.load(data_path)
@@ -117,7 +90,7 @@ def load(model_path: Path | None = None, data_path: Path | None = None,
     if missing:
         raise ValueError(f"전처리 결과에 필요한 열이 없다: {missing}")
 
-    # **모델링과 같은 행 규칙.** 이게 어긋나면 순환신경망 창이 다른 자리에 선다
+    # 학습과 동일한 공통 평가 행을 선택한다.
     rows = d[M.usable(d)].sort_values("ts").reset_index(drop=True)
     test_pos = np.where(rows["split"].to_numpy() == "test")[0]
     if len(test_pos) == 0:
@@ -128,10 +101,7 @@ def load(model_path: Path | None = None, data_path: Path | None = None,
     if tree_pred.shape != (len(test_pos),) or not np.isfinite(tree_pred).all():
         raise ValueError("다음 15분 예측이 유한한 스칼라여야 한다")
 
-    # **최적화를 torch 보다 먼저 만든다.** 순서가 중요하다 —
-    # 뒤에 만들면 프로세스가 끝날 때 세그폴트(종료 코드 139)가 난다.
-    # sklearn·pandas 쪽과 torch 의 libomp 해제 순서가 엉키기 때문으로 보인다.
-    # 계산 결과는 어느 쪽이든 같지만, 서버가 종료마다 죽는 것을 그냥 둘 수 없다.
+    # OpenMP 종료 충돌을 피하도록 비용 계산기를 GRU 추론 전에 초기화한다.
     optimizer = StaffingOptimizer()
 
     net_info, net_pred, mode = None, None, "tree"
@@ -167,20 +137,14 @@ def load(model_path: Path | None = None, data_path: Path | None = None,
 
 def _net_from_subprocess(net_path: Path, data_path: Path,
                          test_pos: np.ndarray) -> tuple[dict | None, np.ndarray | None]:
-    """순환신경망 예측을 **따로 띄운 프로세스**에서 받아 온다.
-
-    왜 한 프로세스에서 안 하나 — sklearn 과 torch 가 같이 있으면 libomp 가 두 번 올라간다.
-    계산은 맞게 나오지만 **프로세스가 끝날 때 세그폴트(139)** 가 난다. 실측으로 확인했다
-    (`no Python frame` — 인터프리터 해제 시점). 서버가 내려갈 때마다 죽는 것을 둘 수 없다.
-    학습에서 `modeling.py` 를 두 프로세스로 나눈 것과 같은 처방이다.
-    """
+    """macOS OpenMP 충돌 방지를 위해 GRU 추론을 별도 프로세스에서 실행한다."""
     import subprocess
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "net.npz"
         r = subprocess.run(
-            [sys.executable, "-B", str(HERE / "net_infer.py"),
+            [sys.executable, "-B", str(HERE / "gru_prediction.py"),
              "--data", str(data_path), "--model", str(net_path), "--out", str(out)],
             cwd=HERE, capture_output=True, text=True)
         if r.returncode != 0 or not out.exists():
@@ -216,14 +180,12 @@ def meta() -> dict:
         name = f"{_state['model_path'].name} + {_state['net_path'].name}"
     else:
         algo, name = tree_name, _state["model_path"].name
-    # 비교 후보 성적과 결합 비율 탐색 — 학습 기록(results.json)을 그대로 보여 준다
+    # 최종·구성 모델 성능과 결합 비율 — 학습 기록(results.json)을 그대로 보여 준다
     candidates, blend_search = None, None
     res_path = _state["model_path"].parent / "results.json"
     if res_path.exists():
         res = json.loads(res_path.read_text(encoding="utf-8"))
-        names = {"ensemble": "결합 (ExtraTrees + GRU)", "et": "ExtraTrees", "et_wx": "ExtraTrees + 기상",
-                 "rf": "RandomForest", "hgb": "HistGradientBoosting", "gru": "GRU", "lstm": "LSTM",
-                 "persistence": "직전값 유지", "tod_dow": "시각×요일 중앙값"}
+        names = {"ensemble": "결합 (ExtraTrees + GRU)", "et": "ExtraTrees", "gru": "GRU"}
         models = res.get("모델별", {})
         order = sorted(models, key=lambda k: models[k].get("전진검증_평균") or 9e9)
         candidates = [{"key": k, "name": names.get(k, k), "forward": models[k].get("전진검증_평균"),
@@ -303,16 +265,8 @@ def snapshot(day: str, cursor: int = 48, threshold: float | None = None) -> dict
 
 def scenario(day: str, cursor: int, production: float, staff: int, hourly_wage: float,
              energy_rate: float, power_factor: float, baseline_staff: int) -> dict:
-    """생산량·인원을 바꿔 보고 비용을 비교한다.
-
-    **주의 — 이 모델에서는 생산량을 바꿔도 예측이 움직이지 않는다.**
-    `생산량` 이 입력 변수에 없기 때문이다. 가이드북 p57 이 생산량을 입력에서 빼
-    최적화 변수로 돌리고, 실측으로도 넣어서 나아지지 않았다(전진검증 64.230 / 63.646 /
-    63.409 로 1 표준오차 안의 동률). 그래서 **전력 예측은 그대로이고 비용만 달라진다.**
-    응답의 `productionIsInput` 으로 그 사실을 알린다 — 화면이 조용히 속지 않게.
-
-    생산량이 예측을 움직이게 하려면 `config.TREE_FEATURES` 에 `생산량_lag4` 를 넣고
-    모델을 다시 학습해야 한다. 그러면 지금 수치는 더 이상 유효하지 않다.
+    """생산량·인원에 따른 비용을 비교한다.
+    생산량은 모델 입력이 아니므로 조건을 바꿔도 모델 예측은 유지한다.
     """
     data = _day(day)
     if cursor >= len(data):
@@ -344,7 +298,7 @@ def scenario(day: str, cursor: int, production: float, staff: int, hourly_wage: 
 
 
 def staffing(day: str, cursor: int = 48, *, historical_replay: bool = False, **over) -> dict:
-    """정시 직전 예측과 사용자 계획 생산량으로 참고 비용을 계산한다."""
+    """정시 직전 예측과 생산 목표로 참고 비용을 계산한다."""
     data = _day(day)
     cursor = min(cursor, len(data) - 1)
     now = data.iloc[cursor]["forecast_time"]

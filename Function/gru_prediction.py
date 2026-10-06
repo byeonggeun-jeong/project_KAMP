@@ -1,18 +1,4 @@
-"""순환신경망 추론만 하는 작은 프로세스. **torch 만 import 한다.**
-
-왜 따로 떼었나
--------------
-sklearn 과 torch 를 한 프로세스에 두면 libomp 가 두 번 올라간다.
-학습에서는 **교착**(Adam 에서 멈춤), 추론에서는 **종료 시 세그폴트**(코드 139)로 나타난다.
-추론 결과 자체는 맞지만 서버가 내려갈 때마다 죽는 것을 둘 수 없다.
-
-그래서 화면 프로세스는 트리(sklearn)만 들고, 순환신경망 예측은 이 프로세스가 내어 준다.
-`modeling.py` 가 학습을 두 프로세스로 나눈 것과 같은 처방이다.
-
-쓰는 법 (보통은 `serving.py` 가 알아서 부른다)
-    python net_infer.py --data <processed.csv> --model <model_gru.pt> --out <나갈.npy>
-표준출력 마지막 줄에 예측 행수를 찍는다.
-"""
+"""저장 GRU의 시드별 예측을 평균한다. OpenMP 충돌 방지를 위해 별도 프로세스에서 실행한다."""
 from __future__ import annotations
 
 import argparse
@@ -26,8 +12,8 @@ import pandas as pd
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-import config as C          # noqa: E402  (torch·sklearn 를 import 하지 않는다)
-import modeling as M        # noqa: E402  (sklearn 은 함수 안에서만 import 된다)
+import settings as C          # noqa: E402  (torch·sklearn 를 import 하지 않는다)
+import model_training as M        # noqa: E402  (sklearn 은 함수 안에서만 import 된다)
 
 
 def predict(data_path: Path, model_path: Path) -> tuple[np.ndarray, np.ndarray, dict]:
@@ -41,7 +27,7 @@ def predict(data_path: Path, model_path: Path) -> tuple[np.ndarray, np.ndarray, 
     if "state_dicts" not in b or "stats" not in b:
         raise SystemExit(
             f"✗ {model_path.name} 이 예전 형식이다(시드 하나·표준화 통계 없음).\n"
-            f"  python modeling.py --models gru  로 다시 학습해라")
+            f"  python model_training.py --models gru  로 다시 학습해라")
 
     d = M.load(data_path)
     rows = d[M.usable(d)].sort_values("ts").reset_index(drop=True)
@@ -62,7 +48,7 @@ def predict(data_path: Path, model_path: Path) -> tuple[np.ndarray, np.ndarray, 
     class Net(nn.Module):
         def __init__(self, n_ch, n_cal, hidden):
             super().__init__()
-            rnn = nn.GRU if b["kind"] == "gru" else nn.LSTM
+            rnn = nn.GRU
             self.rnn = rnn(n_ch, hidden, num_layers=1, batch_first=True)
             self.head = nn.Sequential(nn.Linear(hidden + n_cal, 64), nn.ReLU(),
                                       nn.Linear(64, 1))
@@ -71,7 +57,7 @@ def predict(data_path: Path, model_path: Path) -> tuple[np.ndarray, np.ndarray, 
             o, _ = self.rnn(x)
             return self.head(torch.cat([o[:, -1, :], c], 1)).squeeze(-1)
 
-    # **시드별로 예측한 뒤 평균한다.** 보고 수치가 시드평균이므로 하나만 쓰면 다른 값이 된다
+    # 시드별로 예측한 뒤 평균한다. 보고 수치가 시드평균이므로 하나만 쓰면 다른 값이 된다
     outs = []
     for sd_ in b["state_dicts"]:
         net = Net(Xn.shape[2], CAL.shape[1], g["hidden"])

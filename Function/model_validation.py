@@ -1,11 +1,11 @@
-"""학습 산출물의 버전·내용을 기록하고, 서로 다른 실행의 모델 혼합을 막는다."""
+"""저장 모델의 파일 지문, 입력 설정, 실행 환경을 기록하고 로딩 시 검사한다."""
 from hashlib import sha256
 from importlib.metadata import version
 import json
 from pathlib import Path
 import platform
 
-import config as C
+import settings as C
 
 
 def digest(path):
@@ -24,19 +24,19 @@ def write_manifest(data_path, result_path):
     result = json.loads(Path(result_path).read_text())
     models = result['모델별']
     files = {}
-    for kind in ('rf', 'et', 'hgb', 'et_wx', 'gru', 'lstm'):
+    for kind in ('et', 'gru'):
         if kind in models:
-            path = C.MODEL_DIR / f'model_{kind}.{ "pt" if kind in ("gru", "lstm") else "joblib"}'
+            path = C.MODEL_DIR / f'model_{kind}.{ "pt" if kind == "gru" else "joblib"}'
             files[path.name] = digest(path)
     files[Path(result_path).name] = digest(result_path)
-    import modeling as M
+    import model_training as M
     data = M.load(data_path)
     test = data[M.usable(data) & data['split'].eq('test').to_numpy()]
     row_hash = sha256(test.ts.astype(str).str.cat(sep='\n').encode()).hexdigest()
     manifest = {
         'schema': 2,
         'configuration': configuration(),
-        'source_sha256': {name: digest(C.HERE/name) for name in ('config.py','preprocessing.py','modeling.py','net_infer.py')},
+        'source_sha256': {name: digest(C.HERE/name) for name in ('settings.py','data_preprocessing.py','model_training.py','gru_prediction.py')},
         'data_sha256': digest(data_path),
         'test_rows_sha256': row_hash,
         'files': files,
@@ -45,7 +45,6 @@ def write_manifest(data_path, result_path):
         'window_rule': 'original observation axis; finite continuous 96 observations',
         'normalization': 'first 85% training rows only; validation excluded',
         'ensemble': 'et' in models and 'gru' in models and 'ensemble' in models,
-        # 전진검증으로 고른 트리 비중. 서빙은 이 값으로 섞는다
         'blend_weight': result.get('설정', {}).get('blend_weight'),
     }
     (C.MODEL_DIR/'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2)+'\n')

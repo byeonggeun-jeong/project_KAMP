@@ -143,7 +143,7 @@
   "time_band_source": "https://cyber.kepco.co.kr/ckepco/mobile/footer/pdf/201311/chapter9_131121.pdf#page=42",
   "_설명": [
     "전기요금 요율과 시간대 구분. **자료다** — 요율이 바뀌면 이 파일만 새로 준다.",
-    "공휴일은 여기 두지 않는다. calendar_YYYY.json 한 곳에서만 읽는다 —",
+    "공휴일은 여기 두지 않는다. holiday_calendar.json 한 곳에서만 읽는다 —",
     "두 곳에 두면 갈라진다(예전 config.json 에는 public_holidays_2021 이 따로 있었다)."
   ]
 }

@@ -1,41 +1,6 @@
-"""전처리 결과 하나로 모든 모델을 **같은 행에서** 비교한다.
-
-왜 이렇게 나눴나
-----------------
-`preprocessing.py` 가 만든 CSV 한 장을 모든 모델이 읽는다. 트리는 열을 골라 쓰고
-순환신경망은 같은 파일에서 창을 만든다. 평가행은 같지만 입력 변수·학습 기간·학습 예산은 다르므로 알고리즘 자체의 우열을 뜻하지 않는다.
-
-비교 대상
-  기준선     직전값 유지 · 시각×요일 중앙값          (학습 없음)
-  트리 계열   RandomForest · ExtraTrees · HistGradientBoosting
-  순환 계열   GRU · LSTM                            (시드 3개 예측 평균)
-  결합       ExtraTrees + GRU 고정 반반
-
-같은 행을 쓰게 만드는 규칙
--------------------------
-어느 한 모델이라도 쓸 수 없는 행은 **전부에서 뺀다.** 그래야 수치를 나란히 놓을 수 있다.
-  ① `TREE_FEATURES + NET_CALENDAR + kW + y` 가 전부 있는 행
-  ② 순환신경망 창(96칸)이 **시각 공백을 넘지 않는** 행
-행 기준은 `results.json` 에 적는다 — 다른 기준의 수치와 섞지 말라는 뜻이다.
-
-전진검증 구간도 날짜를 박지 않는다
----------------------------------
-학습 구간의 **마지막 달 시작일 네 개**를 자료에서 뽑아 각 24일로 만든다.
-2021 자료에 분할 경계 20210725 를 주면 04/01·05/01·06/01·07/01 이 나온다.
-
-macOS libomp — 프로세스를 나눠야 한다
-------------------------------------
-sklearn(joblib 포크·OpenMP)을 먼저 돌린 뒤 같은 프로세스에서 torch Adam 이 도는 순간
-libomp 가 두 번 적재되어 교착한다. 환경변수로는 막히지 않는다.
-그래서 이 파일은 **자기를 하위 프로세스로 두 번 호출**한다 — `--only nets`, `--only trees`.
-직접 쓸 때는 `--only` 없이 부르면 된다.
-
-실행
-----
-  python modeling.py --data processed.csv
-  python modeling.py --data processed.csv --models baseline,rf,et,hgb      (트리만, 빠르다)
-  python modeling.py --data processed.csv --models baseline,et,gru,ensemble
-"""
+"""기상 미사용 ExtraTrees와 GRU를 학습하고 결합 비율 및 평가 결과를 저장한다.
+macOS OpenMP 충돌을 피하기 위해 트리와 GRU 학습을 별도 프로세스에서 수행한다.
+기존 모델과 동일한 평가 행 기준과 96구간 입력 창을 유지한다."""
 from __future__ import annotations
 
 import argparse
@@ -48,20 +13,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import config as C
+import settings as C
 
 HERE = Path(__file__).resolve().parent
 
-TREE_MODELS = {"rf": "RandomForest", "et": "ExtraTrees", "hgb": "HistGradientBoosting",
-               "et_wx": "ExtraTrees + 기상"}
-# 트리 종류별 입력. et_wx 만 기상(한 시간 전 확정값)을 더 받는다 — 결합에는 쓰지 않는 비교 후보
-TREE_INPUTS = {k: (C.TREE_FEATURES_WX if k == "et_wx" else C.TREE_FEATURES) for k in TREE_MODELS}
-NET_MODELS = {"gru": "GRU", "lstm": "LSTM"}
-BASE_MODELS = {"persistence": "직전값 유지", "tod_dow": "시각×요일 중앙값"}
-ALL_MODELS = ["baseline", *TREE_MODELS, *NET_MODELS, "ensemble"]
+TREE_MODELS = {"et": "ExtraTrees"}
+TREE_INPUTS = {"et": C.TREE_FEATURES}
+NET_MODELS = {"gru": "GRU"}
+ALL_MODELS = ["et", "gru", "ensemble"]
 
 
-# ══ 공통 ════════════════════════════════════════════════════════════
+# 공통
 def load(path: Path) -> pd.DataFrame:
     d = pd.read_csv(path, parse_dates=["ts"])
     need = ["ts", "date_key", "split", "kW", "y"]
@@ -106,7 +68,7 @@ def usable(d: pd.DataFrame) -> np.ndarray:
     miss = [c for c in (C.TREE_FEATURES_WX + C.NET_CALENDAR) if c not in d.columns]
     if miss:
         raise SystemExit(f"✗ 모델 입력 열이 전처리 결과에 없다: {miss}\n"
-                         f"  preprocessing.py 를 다시 돌렸는지 확인해라")
+                         f"  data_preprocessing.py 를 다시 돌렸는지 확인해라")
     return np.isfinite(d[cols].to_numpy(float)).all(axis=1) & window_ok(d, C.NET["window"])
 
 
@@ -157,41 +119,17 @@ def jobs(d: pd.DataFrame, folds: list[list[int]]) -> list[tuple]:
     return [(lo, hi, str(lo)) for lo, hi in folds] + [(split_day, None, "test")]
 
 
-# ══ 기준선 ══════════════════════════════════════════════════════════
-def run_baselines(d: pd.DataFrame, folds: list[list[int]]) -> dict:
-    day = d["date_key"].to_numpy()
-    out: dict = {k: {} for k in BASE_MODELS}
-    for split, hi, label in jobs(d, folds):
-        te_m = (day >= split) if hi is None else ((day >= split) & (day < hi))
-        tr, te = d[day < split], d[te_m]
-        if len(tr) < 1000 or te.empty:
-            continue
-        y = te["y"].to_numpy()
-        out["persistence"][label] = {**score(y, te["kw_lag1"].to_numpy()),
-                                     "rows": int(len(te))}
-        # 시각×요일 중앙값 — 기준값은 **학습 구간에서만** 만든다
-        key = ["시간", "15분위치", "dow"]
-        med = tr.groupby(key)["y"].median()
-        v = te.set_index(key).index.map(med).to_numpy(float)
-        v = np.where(np.isnan(v), float(tr["y"].median()), v)
-        out["tod_dow"][label] = {**score(y, v), "rows": int(len(te))}
-    return out
 
 
-# ══ 트리 계열 (sklearn 전용 프로세스) ═══════════════════════════════
+# 트리 계열 (sklearn 전용 프로세스)
 def run_trees(d: pd.DataFrame, folds: list[list[int]], want: list[str]) -> dict:
-    from sklearn.ensemble import (ExtraTreesRegressor, HistGradientBoostingRegressor,
-                                  RandomForestRegressor)
+    from sklearn.ensemble import ExtraTreesRegressor
     from sklearn.impute import SimpleImputer
     from sklearn.pipeline import Pipeline
     import joblib
 
     def make(kind: str):
-        if kind == "rf":
-            return RandomForestRegressor(**C.RF)
-        if kind in ("et", "et_wx"):
-            return ExtraTreesRegressor(**C.TREE)
-        return HistGradientBoostingRegressor(**C.BOOST)
+        return ExtraTreesRegressor(**C.TREE)
 
     day = d["date_key"].to_numpy()
     res: dict = {k: {} for k in want}
@@ -220,7 +158,7 @@ def run_trees(d: pd.DataFrame, folds: list[list[int]], want: list[str]) -> dict:
     return res
 
 
-# ══ 순환 계열 (torch 전용 프로세스) ═════════════════════════════════
+# 순환 계열 (torch 전용 프로세스)
 def run_nets(original: pd.DataFrame, folds: list[list[int]], want: list[str],
              data_path: Path, job_spec=None, cache_dir: Path | None = None) -> dict:
     import torch
@@ -232,7 +170,7 @@ def run_nets(original: pd.DataFrame, folds: list[list[int]], want: list[str],
     class Net(nn.Module):
         def __init__(self, n_ch: int, n_cal: int, hidden: int, kind: str):
             super().__init__()
-            rnn = nn.GRU if kind == "gru" else nn.LSTM
+            rnn = nn.GRU
             self.rnn = rnn(n_ch, hidden, num_layers=1, batch_first=True)
             self.head = nn.Sequential(nn.Linear(hidden + n_cal, 64), nn.ReLU(),
                                       nn.Linear(64, 1))
@@ -295,8 +233,7 @@ def run_nets(original: pd.DataFrame, folds: list[list[int]], want: list[str],
                     break
         net.load_state_dict(state)
         ei = np.where(te_m)[0]
-        # **표준화 통계를 함께 돌려준다.** 이것을 저장하지 않아 `.pt` 만으로는 보고 예측을
-        # 되살릴 수 없었다. 추론 때 다시 계산하면 안 된다 — 학습 구간에서 잰 값이어야 한다.
+        # 추론에 재사용할 학습 구간의 표준화 통계를 저장한다.
         stats = {"mu": float(mu), "sd": float(sd), "ymu": float(ymu), "ysd": float(ysd),
                  "train_start": int(start), "train_end": int(split_day),
                  "fit_rows": len(fit), "validation_rows": len(va),
@@ -333,7 +270,7 @@ def run_nets(original: pd.DataFrame, folds: list[list[int]], want: list[str],
         if destination.exists():
             print(f"  완료 학습 재사용 {kind} {split} seed={seed}", flush=True)
             return
-        cmd = [sys.executable, "-B", str(HERE / "modeling.py"), "--data", str(data_path.resolve()),
+        cmd = [sys.executable, "-B", str(HERE / "model_training.py"), "--data", str(data_path.resolve()),
                "--only", "nets", "--models", kind, "--net-job", json.dumps(spec),
                "--cache-dir", str(cache_dir)]
         subprocess.run(cmd, check=True)
@@ -357,7 +294,7 @@ def run_nets(original: pd.DataFrame, folds: list[list[int]], want: list[str],
                 ei, p, ep, st = cached["ei"], cached["pred"], cached["epochs"], cached["stats"]
                 ps.append(p); eps.append(ep); nets.append(net)
                 stats = st            # 시드와 무관하다(학습 구간만으로 정해진다)
-            # **시드별 예측을 평균한다.** 시험 성적으로 시드를 고르지 않는다
+            # 시드별 예측을 평균한다. 시험 성적으로 시드를 고르지 않는다
             mean_p = np.mean(ps, axis=0)
             res[kind][label] = {**score(Y[ei], mean_p), "rows": int(len(ei)),
                                 "epochs": eps, "seeds": C.SEEDS}
@@ -365,8 +302,7 @@ def run_nets(original: pd.DataFrame, folds: list[list[int]], want: list[str],
             preds[f"{kind}|idx|{label}"] = ei
             if label == "test":
                 import torch as T
-                # **시드 전부와 표준화 통계를 담는다.** 보고 예측이 시드 3개 평균이므로
-                # 첫 시드만 저장하면 그 수치를 되살릴 수 없다. 예전 판이 그랬다.
+                # 시드 3개의 모델과 학습 표준화 통계를 함께 저장한다.
                 T.save({"kind": kind, "config": g, "calendar": list(C.NET_CALENDAR),
                         "seeds": list(C.SEEDS),
                         "state_dicts": [{k: v.cpu() for k, v in n.state_dict().items()}
@@ -390,7 +326,7 @@ def run_nets(original: pd.DataFrame, folds: list[list[int]], want: list[str],
     return res
 
 
-# ══ 결합 비율 ═══════════════════════════════════════════════════════
+# 결합 비율
 def search_blend(parts: dict, fold_labels: list[str]) -> dict:
     """트리 비중 w 를 C.BLEND_GRID 로 훑어 C.BLEND_SELECT 기준으로 고른다.
 
@@ -437,7 +373,7 @@ def search_blend(parts: dict, fold_labels: list[str]) -> dict:
     }
 
 
-# ══ 실행 ════════════════════════════════════════════════════════════
+# 실행
 def summarize(res: dict, folds: list[list[int]]) -> dict:
     """전진검증 평균과 시험 성적을 모델별로 모은다."""
     fl = [str(lo) for lo, _ in folds]
@@ -468,7 +404,7 @@ def main() -> int:
     C.MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     if not a.data.exists():
-        print(f"✗ 전처리 결과가 없다: {a.data}\n  preprocessing.py 를 먼저 돌려라")
+        print(f"✗ 전처리 결과가 없다: {a.data}\n  data_preprocessing.py 를 먼저 돌려라")
         return 1
     want = [m.strip() for m in a.models.split(",") if m.strip()]
     bad = [m for m in want if m not in ALL_MODELS]
@@ -509,14 +445,7 @@ def main() -> int:
         (HERE / "_res_nets.json").write_text(json.dumps(res, ensure_ascii=False), "utf-8")
         return 0
 
-    # ── 오케스트레이터 ──
-    if "baseline" in want:
-        print("── 기준선 (학습 없음) ──", flush=True)
-        for k, v in run_baselines(rows, folds).items():
-            res[k] = v
-            print(f"  {BASE_MODELS[k]:22s} {'test':>8} MSE {v.get('test', {}).get('MSE')}",
-                  flush=True)
-
+    # 학습 프로세스 실행
     for kind, sel in (("nets", net_want), ("trees", tree_want)):
         if not sel:
             continue
@@ -532,7 +461,7 @@ def main() -> int:
         if f.exists():
             res.update(json.loads(f.read_text("utf-8")))
 
-    # ── 결합 ──
+    # 결합
     blend_search = None
     if "ensemble" in want:
         tp = HERE / "_pred_trees.npz"
@@ -576,9 +505,9 @@ def main() -> int:
                "행기준설명": "모든 모델이 같은 행을 쓴다. 다른 행 기준의 수치와 섞지 말 것",
                "시험행": int((rows["split"] == "test").sum())},
         "전진검증구간": folds,
-        "설정": {"tree": C.TREE, "rf": C.RF, "boost": C.BOOST, "net": C.NET, "seeds": C.SEEDS,
+        "설정": {"tree": C.TREE, "net": C.NET, "seeds": C.SEEDS,
                "blend_weight": (blend_search or {}).get("선정_트리비중"),
-               "tree_features": C.TREE_FEATURES, "tree_features_wx": C.TREE_FEATURES_WX,
+               "tree_features": C.TREE_FEATURES,
                "net_calendar": C.NET_CALENDAR},
         "결합비율탐색": blend_search,
         "모델별": summary,
@@ -599,10 +528,7 @@ def main() -> int:
         t = (s["시험"] or {}).get("MSE")
         print(f"{k:24s}{f if f is not None else '—':>10}"
               f"{sd if sd is not None else '—':>8}{t if t is not None else '—':>10}")
-    if set(TREE_MODELS).issubset(res) and set(NET_MODELS).issubset(res):
-        from evaluate_duplicates import evaluate
-        evaluate(a.data, a.out)
-    from artifacts import write_manifest
+    from model_validation import write_manifest
     write_manifest(a.data, a.out)
     print(f"\n저장: {a.out.name}")
     return 0
